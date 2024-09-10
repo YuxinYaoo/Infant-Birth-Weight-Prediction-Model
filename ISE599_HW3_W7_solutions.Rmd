@@ -27,14 +27,12 @@ library(glmnet)
 library(ggcorrplot)
 ```
 
-# Questions
-
 ## (1) EDA
 
 **(i) Import the `birthweight` data into R. Check the data are correctly read in.
 
 ```{r}
-bw = read.csv("/Users/yaoyuxin/Desktop/ISE599/HW3/birthweight_predict.csv")
+bw = read.csv("birthweight_predict.csv")
 
 # Inspect the data - was it read in correctly, are variables correctly coded
 head(bw)
@@ -43,7 +41,7 @@ str(bw)
 summary(bw)
 ```
 
-**(ii) Convert numeric variables to factor where appropriate**.
+**(ii) Convert numeric variables to factors where appropriate**.
 
 Baby's sex, mother's race, and father's race are factors and should be recoded. 
 ```{r}
@@ -180,8 +178,6 @@ Moderate correlations exist between baby head size and length. A high correlatio
 
 **(vii) Split the data randomly into a training set (containing 70% of the data) and a test set (containing the remaining 70% of the data).**
 
-**Note:** To ensure reproducible results, please set the seed 101 (`set.seed(101)`). You will need to set this every time you use random number generation, except for when random number generation is called within a loop (e.g., a loop set up for cross validation) -- in this case you can just set the seed before the loop begins. The reason you can do this is that random number generation algorithms produce a long, predetermined list of random numbers. Thus when you set a seed you start selecting numbers from this long list, in a specific order, which gets replicated every time you set the seed. See this happen in the example below; the first and second sets of random numbers are identical where as the second differs from the third because set.seed() was not called again.
-
 ```{r}
 set.seed(101)
 for(i in 1:5) {print(rnorm(3))}
@@ -211,7 +207,7 @@ head(test)
 
 ## (2) Baseline models
 
-**(i) Create a full regression model to predict baby birthweight using all the independent variables in the dataset. Compute the in-sample and out-of-sample R2 for your model. Comment on your findings.**
+**(i) Create a full regression model to predict baby birthweight using all the independent variables in the dataset. Compute the in-sample and out-of-sample R2 for your model.**
 
 Fit full regression model:
 ```{r}
@@ -230,7 +226,7 @@ OSR2.full # 0.652
 
 The OSR2 is high (0.650) -- and higher than the R2. (It is possible for the OSR2 to be higher than the R2, based on how the data are split in to train/test samples; in other words, the training set has many 'hard' cases to learn and your test set has mostly 'easy' cases to predict. Over multiple splits into test/train sets the mean OSR2 will decrease to below R2.). But from this we can preliminarily conclude that out of sample performance is about as high as it can be. Still, we see that a lot of variables are not statistically significant. We may be able to achieve similar performance without inclusion of some of these variables, which may be desirable even if we are not aiming for parsimony given that models with fewer variables are more stable (lower variance).
 
-**(ii) Create a reduced model based on variance inflation factors and statistical significance results from the full model. Compute the in-sample and out-of-sample R2 for your model. Comment on your findings.**
+**(ii) Create a reduced model based on variance inflation factors and statistical significance results from the full model. Compute the in-sample and out-of-sample R2 for your model. **
 
 First we check the significant variables from the full model:
 ```{r}
@@ -254,21 +250,13 @@ All variables in the model are now highly significant. R2 is almost identical to
 
 ## (3) Model selection through regularization and cross validation
 
-You will now perform model selection using cross validation and multiple iterations together with the following model selection techniques:
-
 - **(i) forward and backward stepwise selection**
 - **(ii) the lasso**
 
 For each model selection method, do the following:
 
-- **(a)** Find the best model using the technique with 10-fold and 100-fold cross-validation and a number of iterations of your choosing
-- **(b)** Use plots to show that you have performed enough iterations to achieve confidence in the results (results should show convergence to a mean over iterations).
-- **(c)** Comment on your findings.
-
-**Extra credit** [5 points]:
-
-- [1 point] Calculate the time it takes to run the combination of cross validation and iterations
-- [4 points] Perform cross validation with lasso over iterations using the `cv.glmnet()` function from the `glmnet` package. This exact code has not been shown in lab.
+- Calculate the time it takes to run the combination of cross validation and iterations
+- Perform cross validation with lasso over iterations using the `cv.glmnet()` function from the `glmnet` package. This exact code has not been shown in lab.
 
 ### **(i) Forward and backward stepwise selection**
 
@@ -276,6 +264,7 @@ We implement forward and backward stepwise selection together with cross validat
 
 As noted in lecture, the regularization algorithms do not group levels of categorical variables. We therefore need to consider each dummy variable (each level of factor variables excluding the reference) when setting the `maxvar` number of variables to consider, otherwise we will be missing levels of our variables.
 We can quickly assess the total number of variables including dummy variables to consider by creating a `model.matrix` object (as we will need to do for using the `glmnet` package) and counting the number of columns (representing variables) and subtracting one, for the intercept.
+
 ```{r}
 #Number of predictors
 x.train = model.matrix(bwt ~ ., data=train)
@@ -291,6 +280,7 @@ predict.regsubsets = function(object, newdata, id, ...) {
 ```
 
 **(a)** First, 10-fold cross validation:
+
 ```{r results = 'hide'}
 #Definition of parameters
 n.iterations <- 50
@@ -429,9 +419,9 @@ ggplot(data=best.number.variables.backward.cv) +
        x ="Number of variables", y = "Count")
 ```
 
-**(a)** Second, 100-fold cross validation:
+**(a)** Second, 100-fold cross-validation:
 
-Now we repeat with 100-fold cross validation:
+Now we repeat with 100-fold cross-validation:
 Note this takes some time to run.
 ```{r results = 'hide'}
 #Definition of parameters
@@ -568,8 +558,6 @@ ggplot(data=best.number.variables.backward.cv) +
        x ="Number of variables", y = "Count")
 ```
 
-
-**(c) Comments on results**
 
 We recall that the larger the number of folds, the less bias in the result, but the more variance -- that is, different results over folds. Therefore even more iterations are necessary for convergence of higher n.fold in cross validation. We can see this in the plots of convergence -- they appear slightly less converged than for 10-fold cross validation with the same number of iterations. 
 Note also the long CPU time the 100-fold cv x 50 iteration operation takes: almost 10 minutes!
