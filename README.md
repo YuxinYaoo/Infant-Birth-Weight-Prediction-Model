@@ -1,6 +1,4 @@
 # Infant-Birth-Weight-Prediction-Model
-# Description
-
 Build predictive models of a baby's birthweight from variables measured on the fetus before birth, on the mother and her pregnancy, and on the father and family characteristics. 
 
 This dataset comes from the [Infant Health and Development Program](https://pubmed.ncbi.nlm.nih.gov/1371341), a collaborative, randomized, longitudinal, multisite clinical trial designed to evaluate the efficacy of comprehensive early intervention in reducing the developmental and health problems of low birth weight infants. An intensive intervention extending from hospital discharge to 36 months corrected age was administered at eight different sites. 
