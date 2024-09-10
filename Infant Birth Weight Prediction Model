@@ -1,0 +1,1042 @@
+library(knitr)
+
+opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  eval=TRUE,
+  echo = TRUE,
+  cache=FALSE,
+  include=TRUE,
+  fig.width = 7, 
+  fig.align = 'center',
+  fig.asp = 0.618,
+  out.width = "700px")
+```
+
+
+First, let us import useful packages
+```{r}
+library(ISLR)
+library(caret)
+library(leaps)
+library(gridExtra)
+library(tidyverse)
+library(lars)
+library(gbm)
+library(glmnet)
+library(ggcorrplot)
+```
+
+## (1) EDA
+
+**(i) Import the `birthweight` data into R. Check the data are correctly read in.
+
+```{r}
+bw = read.csv("birthweight_predict.csv")
+
+# Inspect the data - was it read in correctly, are variables correctly coded
+head(bw)
+tail(bw)
+str(bw)
+summary(bw)
+```
+
+**(ii) Convert numeric variables to factors where appropriate**.
+
+Baby's sex, mother's race, and father's race are factors and should be recoded. 
+```{r}
+bw = bw %>% mutate(
+  mrace = factor(mrace, levels = c(1, 2, 3, 4, 8), labels = c("White", "Black", "Asian", "Puerto Rican", "Other")),
+  frace = factor(frace, levels = c(1, 2, 3, 4, 8, 9), labels = c("White", "Black", "Asian", "Puerto Rican", "Other", "Unknown")),
+  babysex = factor(babysex, levels = c(1,2), labels = c("Male", "Female"))
+)
+```
+
+**(iii) Check for missing values, nonsensical values, or outliers.** Include in your answer an investigation of the variable representing weight gain during pregnancy (`wtgain`), which demonstrates negative values, taking into consideration the note above regarding recommended weight gain during pregnancy for different prepregnancy BMI levels. Create a categorical variable for `wtgain` for the levels:
+
+- large loss: wtgain < -10
+- moderate loss: wtgain -10 - 0
+- low gain: wtgain 0 - 20
+- recommended gain: wtgain 20 - 40
+- large gain: wtgain > 40
+
+Use plots to determine the relationship between negative weight gain (weight loss) and prepregnancy bmi (`ppbmi`), and with baby birthweight (`bwt`). Make a proposal about whether and how to address negative values of `wtgain`, given your findings.
+
+```{r}
+summary(bw)
+```
+No missing values (NAs), but we do see that for the `frace` and `mrace` variables, there are no respondents within the `'Other'` and `'Unknown'` categories, respectively. We can therefore remove these categories:
+
+```{r}
+bw = bw %>% mutate(mrace = factor(mrace, levels = c("White", "Black", "Asian", "Puerto Rican")),
+                   frace = factor(frace, levels = c("White", "Black", "Asian", "Puerto Rican", "Other")))
+```
+
+We also noticed from the summary that there are very few values of the `parity` variable -- 
+```{r}
+table(bw$parity)
+```
+All 0's except for one value at 1 and one value at 3. This variable is so imbalanced that it will not contribute well to our predictions and will not be able to be validated in the train/test data. We therefore remove it as well.
+```{r}
+bw$parity = NULL
+```
+
+
+Let's use a boxplot to check for outliers:
+```{r}
+boxplot(bw %>% dplyr::select(-bwt))
+```
+There appears to be a large outlier in ppwt -- let's investigate the rest of the associated observation:
+```{r}
+max(bw$ppwt)
+bw[which.max(bw$ppwt),]
+```
+This mother had a pre pregnancy BMI of 41.3 kg/m^2, which is morbidly obese, but not impossible. Weight was lost during the pregnancy, which could make sense given the high starting weight.
+
+We observe that there are some very negative values in weight gain during pregnancy, whereas we know that all women are recommended to gain some weight during pregnancy. Let's create a categorical variable for wtgain and see if weight loss has a relationship with prepregnancy bmi:
+```{r}
+bw2 <- bw %>%
+  dplyr::mutate(wtgain_level = factor(case_when(wtgain <=  -10 ~ "large loss",
+                                   wtgain <= 0 ~ "moderate loss",
+                                   wtgain <= 20 ~ "low gain",
+                                   wtgain <=  40 ~ "recommended gain", 
+                                   wtgain > 40 ~ "large gain"),
+                                   levels = c("large loss","moderate loss","low gain","recommended gain", "large gain"), 
+                                   ordered = TRUE))
+bw2 %>% 
+  ggplot() +
+  geom_boxplot(aes(x=wtgain_level, y=ppbmi)) +
+  theme_bw()
+```
+It looks like the majority of women who experienced large weight loss during pregnancy started off with a large prepregnancy BMI; the median of which was > 30, putting them into the obese category. Although not recommended, this at least makes larger weight loss less implausible, given there was a high starting point.
+
+We also look at whether baby birthweight varies extensively by level of weight gain during pregnancy:
+```{r}
+bw2 %>% 
+  ggplot() +
+  geom_boxplot(aes(x=wtgain_level,y=bwt)) +
+  theme_bw()
+```
+Overall, there are not extensive differences in baby birthweight by level of weight gain (or loss) during pregnancy.
+For categories moderate loss, low gain, recommended gain, and large gain, we see a slightly increasing trend in baby birthweight with increasing gain if we look at the medians. This pattern does not apply to the large loss category, but the difference may not be significant (does not extend beyond the upper and lower quartiles).
+
+My preliminary conclusion from this investigation is that the majority of large loss occurred in women with very high starting BMI, and so these losses may not be implausible. However, any weight loss in women who started with a *normal* prepregnancy BMI, and still gave birth to a baby with a normal birthweight (which I will define as at least as large as the 1st quartile or above of `bwt`), may be implausible. I will remove these from the dataset before running regression models.
+```{r}
+summary(bw$bwt)
+
+# Identify index of observations meeting the three stated conditions
+wtgain_filter = bw %>% mutate(IDX = c( 1:nrow(bw)) )
+wtgain_filter = wtgain_filter %>% dplyr::filter(ppbmi < 25 & wtgain < -0 & bwt > 2920)
+length(wtgain_filter$IDX)
+
+# Remove observations meeting the three conditions from dataset
+bw = bw[-wtgain_filter$IDX,]
+dim(bw)  # Dataset decreases by 10
+```
+
+
+**(iv) Perform an exploratory data analysis into another combination of variables of your choice**. Using two variables of your choice, construct (two) conditional density plots to visualize the impact of the two factors on baby birthweight. Comment on your findings.
+
+```{r}
+table(bw$babysex)
+bw %>% ggplot() + geom_boxplot(aes(x=babysex,y=bwt)) +
+  theme_bw()
+
+table(bw$mrace)
+bw %>% ggplot(aes(x=bwt, fill=mrace)) +
+  geom_density(alpha=0.4)
+bw %>% ggplot() + geom_violin(aes(x=mrace,y=bwt)) +
+  theme_bw()
+```
+There are slightly more male than female babies in the dataset. Median female baby weight and distribution upper and lower quartiles are very slighlty lower weight than male babies.
+The sample is predominantly made up by white and black mothers. There doesn't appear to be a meaningful relationship between baby weight and mother's race.
+
+**(vi) Create a scatterplot of the correlation between all independent variables and the dependent variable, and a correlation plot between all independent variables. Comment on your findings.**
+
+```{r}
+bwmelt = bw %>% dplyr::select(-c(frace, mrace)) %>% reshape2::melt(id="bwt")
+ggplot(bwmelt) +
+  geom_point(aes(x=value, y=bwt), size = 0.75) +
+  geom_smooth(aes(x=value, y=bwt)) +
+  facet_wrap(~variable, scales="free_x")+theme(legend.position='none')
+```
+The only two variables that are clearly linearly correlated with baby weight are `bhead` and `blength`, besides some outlier values for the latter. `ppbmi` may have a slight positive linear relationship with baby weight as well.
+
+Overall, none of the variables appear to have a polynomial relationship with the outcome.
+
+Now let's a correlation plot between all variables. 
+```{r}
+bw_numeric = bw %>% dplyr::select(-c(babysex, frace, mrace))
+c = cor(bw_numeric)
+c
+# visualize the correlation matrix
+library(corrplot)
+corrplot(c, addCoef.col = "red")
+```
+
+Moderate correlations exist between baby head size and length. A high correlation (0.85) exists between prepregnancy bmi and prepregnancy weight, as would be expected. We may be able to remove one of these variables from our dataset.
+
+**(vii) Split the data randomly into a training set (containing 70% of the data) and a test set (containing the remaining 70% of the data).**
+
+```{r}
+set.seed(101)
+for(i in 1:5) {print(rnorm(3))}
+
+set.seed(101)
+for(i in 1:5) {print(rnorm(3))}
+
+for(i in 1:5) {print(rnorm(3))}
+```
+
+
+```{r}
+set.seed(101)
+# Sample the indices in the training set---comprising 70% of the observations
+train.obs <- sample(1:nrow(bw), 
+                    0.7 * nrow(bw),
+                    replace = F) %>% sort() 
+train <- bw[train.obs, ]
+test <- bw[-train.obs, ]
+
+# Let us inspect the train and test data
+head(train)
+head(test)
+```
+
+
+
+## (2) Baseline models
+
+**(i) Create a full regression model to predict baby birthweight using all the independent variables in the dataset. Compute the in-sample and out-of-sample R2 for your model.**
+
+Fit full regression model:
+```{r}
+full <- lm(bwt ~ . , data=train)
+summary(full)
+R2.full = summary(full)$r.squared
+R2.full # 0.608
+
+library(car)
+vif(full)
+
+prediction.full <- predict(full, newdata=test)
+OSR2.full <- 1 - sum((prediction.full - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.full # 0.652
+```
+
+The OSR2 is high (0.650) -- and higher than the R2. (It is possible for the OSR2 to be higher than the R2, based on how the data are split in to train/test samples; in other words, the training set has many 'hard' cases to learn and your test set has mostly 'easy' cases to predict. Over multiple splits into test/train sets the mean OSR2 will decrease to below R2.). But from this we can preliminarily conclude that out of sample performance is about as high as it can be. Still, we see that a lot of variables are not statistically significant. We may be able to achieve similar performance without inclusion of some of these variables, which may be desirable even if we are not aiming for parsimony given that models with fewer variables are more stable (lower variance).
+
+**(ii) Create a reduced model based on variance inflation factors and statistical significance results from the full model. Compute the in-sample and out-of-sample R2 for your model. **
+
+First we check the significant variables from the full model:
+```{r}
+significant.variables <- which(summary(full)$coefficients[,4]<.05)
+significant.variables
+```
+We will now try a simple reduced model that includes only these variables (remembering that we need to use all factors of a categorical variable even if only one is statistically significant):
+```{r}
+reduced <- lm(bwt ~ babysex + bhead + blength + mrace + smoken + wtgain, data=train)
+summary(reduced)
+R2.reduced = summary(reduced)$r.squared
+R2.reduced # 0.600
+
+prediction.reduced <- predict(reduced,
+                           newdata=test)
+OSR2.reduced <- 1 - sum((prediction.reduced - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.reduced  # 0.646
+```
+All variables in the model are now highly significant. R2 is almost identical to that for the full model. OSR2 is very slightly reduced and still higher than R2 (again, this would likely reverse following multiple splits of the data into testing / training data). We did not reach this model using the most robust methods, but it may still be a good model.
+
+
+## (3) Model selection through regularization and cross validation
+
+- **(i) forward and backward stepwise selection**
+- **(ii) the lasso**
+
+For each model selection method, do the following:
+
+- Calculate the time it takes to run the combination of cross validation and iterations
+- Perform cross validation with lasso over iterations using the `cv.glmnet()` function from the `glmnet` package. This exact code has not been shown in lab.
+
+### **(i) Forward and backward stepwise selection**
+
+We implement forward and backward stepwise selection together with cross validation over multiple iterations, as done in Lab 5.
+
+As noted in lecture, the regularization algorithms do not group levels of categorical variables. We therefore need to consider each dummy variable (each level of factor variables excluding the reference) when setting the `maxvar` number of variables to consider, otherwise we will be missing levels of our variables.
+We can quickly assess the total number of variables including dummy variables to consider by creating a `model.matrix` object (as we will need to do for using the `glmnet` package) and counting the number of columns (representing variables) and subtracting one, for the intercept.
+
+```{r}
+#Number of predictors
+x.train = model.matrix(bwt ~ ., data=train)
+k = ncol(x.train) - 1  # 19 variables including dummy variables
+
+#Manual prediction function
+predict.regsubsets = function(object, newdata, id, ...) {
+  form = as.formula(object$call[[2]])
+  mat = model.matrix(form, newdata)
+  coefi = coef(object, id = id)
+  mat[, names(coefi)] %*% coefi
+}
+```
+
+**(a)** First, 10-fold cross validation:
+
+```{r results = 'hide'}
+#Definition of parameters
+n.iterations <- 50
+n.folds <- 10
+cv.r2.forward.all <- data.frame(maxvar=1:k)
+cv.r2.backward.all <- data.frame(maxvar=1:k)
+cv.forward.best.number.variables <- rep(NA,n.iterations)
+cv.backward.best.number.variables <- rep(NA,n.iterations)
+
+#Replications
+
+start_time <- Sys.time()
+set.seed(101)
+for (iter in 1:n.iterations){
+  
+  #Create folds for iteration iter
+  folds <- rep(NA,nrow(train))
+  order_indices <- sample(1:nrow(train),nrow(train),replace=FALSE)
+  indices.in.folds <- sort(c(rep(1:n.folds,floor(nrow(train)/n.folds))))
+  if (nrow(train)-floor(nrow(train)/n.folds)*n.folds!=0){
+    indices.in.folds <- sort(c(indices.in.folds,1:(nrow(train)-floor(nrow(train)/n.folds)*n.folds)))
+  }
+  for (i.fold in 1:n.folds){
+    folds[order_indices[indices.in.folds==i.fold]] <- i.fold
+  }
+  
+  #Initialize matrices of dimension #folds by #variables in subset (10 x 14) to put fold best results into
+  cv.r2.forward.iteration <- matrix(NA,n.folds,k,dimnames=list(NULL,paste(1:k)))
+  cv.r2.backward.iteration <- matrix(NA,n.folds,k,dimnames=list(NULL,paste(1:k)))
+  
+  #Loop over all the folds
+  for (i.fold in 1:n.folds){
+    
+    #Fitting the models -- we train on all folds but fold number `i.fold`, which is reserved for testing
+    forward.subset <- regsubsets(bwt ~ ., data=train[folds!=i.fold,],nvmax=k,method="forward")
+    backward.subset <- regsubsets(bwt ~ ., data=train[folds!=i.fold,],nvmax=k,method="backward")
+    
+    for (j in 1:k){ 
+  
+      #Prediction and performance assessment for each number of subsets 1:k for iteration iter
+      
+      ## We predict on the fold number i.fold, our current validation set
+      ## Mean baseline is calculated over all folds besides i.fold
+      
+      #(*To complete*)
+      ##Forward subsets
+      prediction.forward.subset <- predict.regsubsets(forward.subset,train[folds==i.fold,],id=j)
+      cv.r2.forward.iteration[i.fold,j] <-
+        1 - sum((prediction.forward.subset - train[folds==i.fold,]$bwt)^2) / sum((mean(train[folds!=i.fold,]$bwt) - train[folds==i.fold,]$bwt)^2)
+      
+      ##Backward subsets
+      prediction.backward.subset <- predict.regsubsets(backward.subset,train[folds==i.fold,],id=j)
+      cv.r2.backward.iteration[i.fold,j] <-
+        1 - sum((prediction.backward.subset - train[folds==i.fold,]$bwt)^2) / sum((mean(train[folds!=i.fold,]$bwt) - train[folds==i.fold,]$bwt)^2)
+    }
+  }
+  
+  #Iterative collection of all results over all iterations -- for each iteration store the average R2 over all folds at each #variables 1:k 
+  cv.r2.forward.all <- cbind(cv.r2.forward.all, colMeans(cv.r2.forward.iteration))
+  cv.r2.backward.all <- cbind(cv.r2.backward.all, colMeans(cv.r2.backward.iteration))
+
+  #Best parameter values at each iteration (for use in)
+  cv.forward.best.number.variables[iter] <- which.max(cv.r2.forward.all[,iter+1])
+  cv.backward.best.number.variables[iter] <- which.max(cv.r2.backward.all[,iter+1])
+}
+
+end_time <- Sys.time()
+tot_time_10fold_50iter = round(end_time-start_time, 2)
+tot_time_10fold_50iter
+
+#Add the mean over all iterations to the R2 by iteration output matrix
+cv.r2.forward.all <- cbind(cv.r2.forward.all, rowMeans(cv.r2.forward.all[,2:(n.iterations+1)]))
+cv.r2.backward.all <- cbind(cv.r2.backward.all, rowMeans(cv.r2.backward.all[,2:(n.iterations+1)]))
+
+#Name the columns, the last one is the mean
+colnames(cv.r2.forward.all) <- c("maxvar",rep(paste0('iter',1:n.iterations)),"mean")
+colnames(cv.r2.backward.all) <- c("maxvar",rep(paste0('iter',1:n.iterations)),'mean')
+```
+
+Best overall results -- to find best number of variables, we find the number of variables at the maximum of the mean R2 at each number of variables over all iterations. In other words, we find the mean R2 over all iterations at each number of variables, and then choose the number of variables giving the max mean(R2) over those iterations.
+```{r}
+cv.r2.forward.mean <- cv.r2.forward.all %>% dplyr::select(mean)
+cv.r2.backward.mean <- cv.r2.backward.all %>% dplyr::select(mean)
+cv.overall.best.forward.10fold <- which.max(cv.r2.forward.all$mean)
+cv.overall.best.forward.10fold # 9
+cv.overall.best.backward.10fold <- which.max(cv.r2.backward.all$mean)
+cv.overall.best.backward.10fold # 9
+```   
+The best number of variables selected by both forward and backwards selection algorithms using 10-fold cross validation over 50 iterations is 9. Below we will look at the coefficients to see how many of the levels of categorical variables are included.
+
+**(b) Plots of convergence over iterations**
+
+We show two types of plots to confirm that we have conducted enough iterations to achieve stability in our results: line plots of the validation set R2 over all iterations and histograms of the distribution of the selection of the best number of variables.
+
+*Plots of performance over all iterations, 10 fold cv*
+```{r}
+cv.r2.forward.all.melt = cv.r2.forward.all %>% reshape2::melt(id="maxvar")
+ggplot(cv.r2.forward.all.melt) +
+  geom_line(aes(x=maxvar, y=value, color=variable), lwd=1, show.legend = FALSE) +
+  theme_bw() + 
+  labs(title="Convergence over iterations: Forward subset selection, 10 fold cv, 50 iter",
+        x ="Number of variables", y = "Cross-validation R2")
+
+cv.r2.backward.all.melt = cv.r2.forward.all %>% reshape2::melt(id="maxvar")
+ggplot(cv.r2.backward.all.melt) +
+  geom_line(aes(x=maxvar, y=value, color=variable), lwd=1, show.legend = FALSE) +
+  theme_bw() +
+  labs(title="Convergence over iterations: Backward subset selection, 10 fold cv, 50 iter",
+       x ="Number of variables", y = "Cross-validation R2")
+```
+Over iterations we can see that model performance stays consistent for number of variables 9 and above. We will ultimately want to choose a model with the categorical variables grouped,likely leading to more than 9 variables.
+
+
+*Histograms of best number of variables over all iterations, 10 fold cv*
+```{r}
+# Forward
+best.number.variables.forward.cv <- data.frame(iter=1:n.iterations,forward=cv.forward.best.number.variables)
+ggplot(data=best.number.variables.forward.cv) +
+  geom_histogram(aes(x=forward)) +
+  xlab("Number of variables") +
+  ylab("Count") +
+  xlim(0,20) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best n. of variables over iterations: Forward subset selection, 10 fold cv, 50 iter",
+       x ="Number of variables", y = "Count")
+
+# Backward
+best.number.variables.backward.cv <- data.frame(iter=1:n.iterations,backward=cv.backward.best.number.variables)
+ggplot(data=best.number.variables.backward.cv) +
+  geom_histogram(aes(x=backward)) +
+  xlab("Number of variables") +
+  ylab("Count") +
+  xlim(0,20) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best n. of variables over iterations: Backward subset selection, 10 fold cv, 50 iter",
+       x ="Number of variables", y = "Count")
+```
+
+**(a)** Second, 100-fold cross-validation:
+
+Now we repeat with 100-fold cross-validation:
+Note this takes some time to run.
+```{r results = 'hide'}
+#Definition of parameters
+n.iterations <- 50
+n.folds <- 100
+cv.r2.forward.all <- data.frame(maxvar=1:k)
+cv.r2.backward.all <- data.frame(maxvar=1:k)
+cv.forward.best.number.variables <- rep(NA,n.iterations)
+cv.backward.best.number.variables <- rep(NA,n.iterations)
+
+#Replications
+
+start_time <- Sys.time()
+set.seed(101)
+for (iter in 1:n.iterations){
+  
+  #Create folds for iteration iter
+  folds <- rep(NA,nrow(train))
+  order_indices <- sample(1:nrow(train),nrow(train),replace=FALSE)
+  indices.in.folds <- sort(c(rep(1:n.folds,floor(nrow(train)/n.folds))))
+  if (nrow(train)-floor(nrow(train)/n.folds)*n.folds!=0){
+    indices.in.folds <- sort(c(indices.in.folds,1:(nrow(train)-floor(nrow(train)/n.folds)*n.folds)))
+  }
+  for (i.fold in 1:n.folds){
+    folds[order_indices[indices.in.folds==i.fold]] <- i.fold
+  }
+  
+  #Initialize matrices of dimension #folds by #variables in subset (10 x 14) to put fold best results into
+  cv.r2.forward.iteration <- matrix(NA,n.folds,k,dimnames=list(NULL,paste(1:k)))
+  cv.r2.backward.iteration <- matrix(NA,n.folds,k,dimnames=list(NULL,paste(1:k)))
+  
+  #Loop over all the folds
+  for (i.fold in 1:n.folds){
+    
+    #Fitting the models -- we train on all folds but fold number `i.fold`, which is reserved for testing
+    forward.subset <- regsubsets(bwt ~ ., data=train[folds!=i.fold,],nvmax=k,method="forward")
+    backward.subset <- regsubsets(bwt ~ ., data=train[folds!=i.fold,],nvmax=k,method="backward")
+    
+    for (j in 1:k){ 
+      
+      #Prediction and performance assessment for each number of subsets 1:k for iteration iter
+      
+      ## We predict on the fold number i.fold, our current validation set
+      ## Mean baseline is calculated over all folds besides i.fold
+      
+      #(*To complete*)
+      ##Forward subsets
+      prediction.forward.subset <- predict.regsubsets(forward.subset,train[folds==i.fold,],id=j)
+      cv.r2.forward.iteration[i.fold,j] <-
+        1 - sum((prediction.forward.subset - train[folds==i.fold,]$bwt)^2) / sum((mean(train[folds!=i.fold,]$bwt) - train[folds==i.fold,]$bwt)^2)
+      
+      ##Backward subsets
+      prediction.backward.subset <- predict.regsubsets(backward.subset,train[folds==i.fold,],id=j)
+      cv.r2.backward.iteration[i.fold,j] <-
+        1 - sum((prediction.backward.subset - train[folds==i.fold,]$bwt)^2) / sum((mean(train[folds!=i.fold,]$bwt) - train[folds==i.fold,]$bwt)^2)
+    }
+  }
+  
+  #Iterative collection of all results over all iterations -- for each iteration store the average R2 over all folds at each #variables 1:k 
+  cv.r2.forward.all <- cbind(cv.r2.forward.all, colMeans(cv.r2.forward.iteration))
+  cv.r2.backward.all <- cbind(cv.r2.backward.all, colMeans(cv.r2.backward.iteration))
+
+  #Best parameter values at each iteration (for use in)
+  cv.forward.best.number.variables[iter] <- which.max(cv.r2.forward.all[,iter+1])
+  cv.backward.best.number.variables[iter] <- which.max(cv.r2.backward.all[,iter+1])
+}
+
+end_time <- Sys.time()
+tot_time_100fold_50iter = round(end_time-start_time, 2)
+tot_time_100fold_50iter
+
+#Add the mean over all iterations to the R2 by iteration output matrix
+cv.r2.forward.all <- cbind(cv.r2.forward.all, rowMeans(cv.r2.forward.all[,2:(n.iterations+1)]))
+cv.r2.backward.all <- cbind(cv.r2.backward.all, rowMeans(cv.r2.backward.all[,2:(n.iterations+1)]))
+
+#Name the columns, the last one is the mean
+colnames(cv.r2.forward.all) <- c("maxvar",rep(paste0('iter',1:n.iterations)),"mean")
+colnames(cv.r2.backward.all) <- c("maxvar",rep(paste0('iter',1:n.iterations)),'mean')
+```
+
+Best overall results
+```{r}
+cv.r2.forward.mean <- cv.r2.forward.all %>% dplyr::select(mean)
+cv.r2.backward.mean <- cv.r2.backward.all %>% dplyr::select(mean)
+cv.overall.best.forward.100fold <- which.max(cv.r2.forward.all$mean)
+cv.overall.best.forward.100fold # 9
+cv.overall.best.backward.100fold <- which.max(cv.r2.backward.all$mean)
+cv.overall.best.backward.100fold # 9
+```   
+Using 100-fold CV over 50 iterations, the best number of variables selected by forward and backwards selection is the same as with 10-fold CV.
+
+**(b) Plots of convergence over iterations**
+The following plots show convergence in results with 100-fold cv:
+
+*Plots of performance over all iterations, 100 fold cv*
+```{r}
+cv.r2.forward.all.melt = cv.r2.forward.all %>% reshape2::melt(id="maxvar")
+ggplot(cv.r2.forward.all.melt) +
+  geom_line(aes(x=maxvar, y=value, color=variable), lwd=1, show.legend = FALSE) +
+  theme_bw() + 
+  labs(title="Convergence over iterations: Forward subset selection, 100 fold cv, 50 iter",
+        x ="Number of variables", y = "Cross-validation R2")
+
+cv.r2.backward.all.melt = cv.r2.forward.all %>% reshape2::melt(id="maxvar")
+ggplot(cv.r2.backward.all.melt) +
+  geom_line(aes(x=maxvar, y=value, color=variable), lwd=1, show.legend = FALSE) +
+  theme_bw() +
+  labs(title="Convergence over iterations: Backward subset selection, 100 fold cv, 50 iter",
+       x ="Number of variables", y = "Cross-validation R2")
+```
+
+*Histograms of best number of variables over all iterations, 100 fold cv*
+```{r}
+# Forward
+best.number.variables.forward.cv <- data.frame(iter=1:n.iterations,forward=cv.forward.best.number.variables)
+ggplot(data=best.number.variables.forward.cv) +
+  geom_histogram(aes(x=forward)) +
+  xlab("Number of variables") +
+  ylab("Count") +
+  xlim(0,20) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best n. of variables over iterations: Forward subset selection, 100 fold cv, 50 iter",
+       x ="Number of variables", y = "Count")
+
+# Backward
+best.number.variables.backward.cv <- data.frame(iter=1:n.iterations,backward=cv.backward.best.number.variables)
+ggplot(data=best.number.variables.backward.cv) +
+  geom_histogram(aes(x=backward)) +
+  xlab("Number of variables") +
+  ylab("Count") +
+  xlim(0,20) +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best n. of variables over iterations: Backward subset selection, 100 fold cv, 50 iter",
+       x ="Number of variables", y = "Count")
+```
+
+
+We recall that the larger the number of folds, the less bias in the result, but the more variance -- that is, different results over folds. Therefore even more iterations are necessary for convergence of higher n.fold in cross validation. We can see this in the plots of convergence -- they appear slightly less converged than for 10-fold cross validation with the same number of iterations. 
+Note also the long CPU time the 100-fold cv x 50 iteration operation takes: almost 10 minutes!
+For all these reasons we generally use 5- or 10-fold cv. 
+Here, we will use the models selected by 10-fold cv.
+
+What are the forms of these final models, and their OSR2 (on the vaulted test data)?
+```{r}
+forward.best <- regsubsets(bwt ~ ., data = train, nvmax = k, method = "forward")
+```
+
+First let's look at the form and results of the model with id = `r cv.overall.best.forward.10fold`, the best number of variables found by forwards and backwards selection:
+```{r}
+coef(forward.best, cv.overall.best.forward.10fold)
+
+prediction.forward.subset.best <- predict.regsubsets(object=forward.best, newdata=test, id=cv.overall.best.forward.10fold)
+OSR2.forward.subset.best <- 1 - sum((prediction.forward.subset.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.forward.subset.best # 0.650
+```
+1 level each of the `frace` and the `mrace` variables are included. 
+
+Given this, we have 2 options for choosing a best model by subset selection that maintains grouping of categorical variables. We can go with the model with all variables (19), which will by necessity include all levels of each categorical variable; we saw from the performance plots that validation-set R2 remains almost identical for 9 -- 19 variables included in the model:
+
+```{r}
+coef(forward.best, 19)
+
+prediction.forward.subset.best <- predict.regsubsets(object=forward.best, newdata=test, id=19)
+OSR2.forward.subset.best.19 <- 1 - sum((prediction.forward.subset.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.forward.subset.best.19 # 0.652
+```
+The OSR2 is identical to what we got with the full regression model -- as expected.
+
+
+Our other option is to fit a regression model using all variables included in the best forward selection model with 9 variables, and adding back in the remaining levels for the grouped variables.
+```{r}
+coef(forward.best, 9)
+
+forward.alternative.best <- lm(bwt ~ babysex + bhead + blength + frace + mheight + mrace + ppwt + smoken + wtgain, train)
+summary(forward.alternative.best)
+R2.forward.alternative.best = summary(forward.alternative.best)$r.squared
+R2.forward.alternative.best # 0.607
+
+prediction.forward.alternative.best <- predict(forward.alternative.best, newdata=test)
+OSR2.forward.alternative.best <- 1 - sum((prediction.forward.alternative.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.forward.alternative.best # 0.651
+```
+
+We can do the same for backwards subset selection:
+
+```{r}
+backward.best <- regsubsets(bwt ~ ., data = train, nvmax = k, method = "forward")
+coef(forward.best, cv.overall.best.backward.10fold)
+
+prediction.backward.subset.best <- predict.regsubsets(object=backward.best, newdata=test, id=cv.overall.best.backward.10fold)
+OSR2.backward.subset.best <- 1 - sum((prediction.backward.subset.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.backward.subset.best # 0.650
+
+prediction.backward.subset.best <- predict.regsubsets(object=backward.best, newdata=test, id=19)
+OSR2.backward.subset.best.19 <- 1 - sum((prediction.backward.subset.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.backward.subset.best.19 # 0.652 -- We knew this would be the same as the forward selection model with 19 variables 
+```
+
+Fitting a regression model using all variables included in the best backward selection model with 9 variables, and adding back in the remaining levels for the grouped variables.
+```{r}
+coef(backward.best, 9)
+```
+The best model by backward selection and 9 variables includes the same variables as for forward selection. The results will therefore be identical:
+```{r}
+backward.alternative.best <- lm(bwt ~ babysex + bhead + blength + frace + mheight + mrace + ppwt + smoken + wtgain, train)
+summary(backward.alternative.best)
+R2.backward.alternative.best = summary(backward.alternative.best)$r.squared
+R2.backward.alternative.best # 0.607
+
+prediction.backward.alternative.best <- predict(backward.alternative.best, newdata=test)
+OSR2.backward.alternative.best <- 1 - sum((prediction.backward.alternative.best - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.backward.alternative.best # 0.651
+```
+
+We choose the forward.alternative.best and backward.alternative.best models as the best models for forward and backward selection, since they perform almost equivalently to the full model while being more parsimonious.
+
+
+
+### **(ii) Lasso**
+
+**(a)** lasso with 10-fold cross validation
+```{r}
+set.seed(101)
+
+x.train = model.matrix(bwt ~ . , data=train)
+y.train = train$bwt 
+x.test = model.matrix(bwt ~ . , data=test) 
+y.test = test$bwt
+
+lambdas.lasso <- c(exp(seq(10, -5, -.1)),0)
+N.lambda.lasso <- length(lambdas.lasso)
+
+n.iterations <- 50
+n.folds <- 10
+
+start_time = Sys.time()
+set.seed(101)
+res = lapply(1:n.iterations, function(i){
+  fit = cv.glmnet(x=x.train,y=y.train,nfolds=n.folds,lambda=lambdas.lasso,alpha=1)
+  res = data.frame(iter=i, lambda=fit$lambda, MSE_mean=fit$cvm, se=fit$cvsd)
+  return(res)
+})
+res = do.call(rbind,res)
+
+end_time = Sys.time()
+tot_time_lasso_10fold_50iter = round(end_time-start_time, 2)
+tot_time_lasso_10fold_50iter
+
+# To find the best lambda overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then choose the lambda that minimizes that mean MSE:
+summarized_lambda = res %>% 
+  group_by(lambda) %>% 
+  summarise(MSE=mean(MSE_mean),
+            se=mean(se)) %>%
+  arrange(desc(lambda))
+
+idx = which.min(summarized_lambda$MSE)
+cv.lasso.best.lambda.overall.10fold = summarized_lambda$lambda[idx]
+cv.lasso.best.lambda.overall.10fold
+
+# To find the best lambda+1se overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then find the lambda that minimizes that mean MSE (above). Then we find the closest lambda value giving the MSE equal to min(MSE)+1se:
+index_1se = with(summarized_lambda,which(MSE < MSE[idx]+se[idx])[1])
+cv.lasso.lambda.1SErule.overall.10fold = summarized_lambda$lambda[index_1se]
+cv.lasso.lambda.1SErule.overall.10fold
+
+# Another approach to find the best lambda with 1se rule over all iterations involves first calculating best results for each iteration and then looking across iterations -- this may not give identical results to the approach above, which calculates mean error over all iterations first.
+# By this approach, we first find the min MSE for each iteration, then add the associated sd at that min error. Then we find the closest lambda giving the MSE equal to that min error + 1SE:
+summarized_iter = res %>% 
+  mutate(MSE_SE = MSE_mean+se) %>% 
+  group_by(iter) %>% 
+  summarise(min_MSE_index = which.min(MSE_mean),
+            best_lambda_iter = lambda[min_MSE_index],  # Lambda giving min(MSE) for iter
+            min_MSE1se = MSE_SE[min_MSE_index],     # min(MSE) + 1se--at that value of lambda
+            lambda1se = lambda[which.min(abs(min_MSE1se - MSE_mean))],  # lambda at the observed MSE closest to min(MSE)+1se 
+            idx_lambda1se = which.min(abs(min_MSE1se - MSE_mean))  # idx of the lambda giving the observed MSE closest to min(MSE)+1se
+  )
+cv.lasso.lambda.1SErule.overall_2 = median(summarized_iter$lambda1se) 
+cv.lasso.lambda.1SErule.overall_2
+# We will also use the summarized_iter data frame to plot histograms of the best lambda by iteration
+```
+
+
+**(b) Plots of convergence over iterations, 10 fold cv**
+
+The following plots show that we achieve convergence in results with 10-fold cv:
+
+*Plots of performance over all iterations, 10 fold cv*
+```{r}
+ggplot(res) +
+  geom_line(aes(x=log(lambda), y=MSE_mean, color=as.factor(iter)), lwd=1, show.legend = TRUE) +
+  theme_bw() + 
+  labs(title="Convergence over iterations: Lasso, 10 fold cv, 50 iter",
+        x ="log(lambda)", y = "MSE")
+```
+
+*Histogram of best number of variables over all iterations, 10 fold cv*
+```{r}
+ggplot(data=summarized_iter) +
+  geom_histogram(aes(x=log(best_lambda_iter))) +
+  xlab("log(lambda)") +
+  ylab("Count") +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best log(lambda) over iterations: lasso, 10 fold cv, 50 iter",
+       x ="log(lambda)", y = "Count")
+```
+
+
+**(a)** lasso with 100-fold cross validation
+```{r}
+set.seed(101)
+
+n.iterations <- 50
+n.folds <- 100
+
+start_time = Sys.time()
+set.seed(101)
+res = lapply(1:n.iterations, function(i){
+  fit = cv.glmnet(x=x.train,y=y.train,nfolds=n.folds,lambda=lambdas.lasso,alpha=1)
+  data.frame(iter=i, lambda=fit$lambda, MSE_mean=fit$cvm, se=fit$cvsd)
+})
+res = do.call(rbind,res)
+
+end_time = Sys.time()
+tot_time_lasso_100fold_50iter = round(end_time-start_time, 2)
+tot_time_lasso_100fold_50iter
+
+# To find the best lambda overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then choose the lambda that minimizes that mean MSE:
+summarized_lambda = res %>% 
+  group_by(lambda) %>% 
+  summarise(MSE=mean(MSE_mean),
+            se=mean(se)) %>%
+  arrange(desc(lambda))
+
+idx = which.min(summarized_lambda$MSE)
+cv.lasso.best.lambda.overall.100fold = summarized_lambda$lambda[idx]
+cv.lasso.best.lambda.overall.100fold
+
+# To find the best lambda+1se overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then find the lambda that minimizes that mean MSE (above). Then we find the closest lambda value giving the MSE equal to min(MSE)+1se:
+index_1se = with(summarized_lambda,which(MSE < MSE[idx]+se[idx])[1])
+cv.lasso.lambda.1SErule.overall.100fold = summarized_lambda$lambda[index_1se]
+cv.lasso.lambda.1SErule.overall.100fold
+```
+
+
+**(b) Plots of convergence over iterations, 100 fold cv**
+
+The following plots show that we achieve convergence in results with 100-fold cv:
+
+*Plots of performance over all iterations, 100 fold cv*
+```{r}
+ggplot(res) +
+  geom_line(aes(x=log(lambda), y=MSE_mean, color=as.factor(iter)), lwd=1, show.legend = TRUE) +
+  theme_bw() + 
+  labs(title="Convergence over iterations: Lasso, 100 fold cv, 50 iter",
+        x ="log(lambda)", y = "MSE")
+```
+
+*Histogram of best number of variables over all iterations, 100 fold cv*
+```{r}
+ggplot(data=summarized_iter) +
+  geom_histogram(aes(x=log(best_lambda_iter))) +
+  xlab("log(lambda)") +
+  ylab("Count") +
+  theme(axis.title=element_text(size=18), axis.text=element_text(size=18)) +
+  labs(title="Best log(lambda) over iterations: lasso, 100 fold cv, 50 iter",
+       x ="log(lambda)", y = "Count")
+```
+
+
+**(c) Comments on results**
+
+We find highly convergent results over 50 iterations of 100-fold cross validation. These highly convergent results are in large part attributable to this particular set of variables and prediction task, since we have seen that the full linear regression model has very high OSR2 and thus the model with the full set of variables is not too complex (and does not lead to instability in OOS performance).
+
+What are the forms of the final models for 10- and 100-fold cv, and their OSR2 (on the vaulted test data)?
+
+For 10-fold cv:
+```{r}
+lasso.final.10fold <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.best.lambda.overall.10fold)
+coef(lasso.final.10fold)
+pred.test.final.lasso.10fold <- predict(lasso.final.10fold,x.test)
+OSR2.lasso.final.10fold <- 1-sum((pred.test.final.lasso.10fold-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.10fold  # 0.651 
+
+lasso.final.1se.10fold <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.lambda.1SErule.overall.10fold)
+coef(lasso.final.1se.10fold)
+pred.test.final.lasso.1se.10fold <- predict(lasso.final.1se.10fold, x.test)
+OSR2.lasso.final.1se.10fold <- 1-sum((pred.test.final.lasso.1se.10fold-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.1se.10fold  # 0.624
+```
+
+For 100-fold cv:
+```{r}
+lasso.final.100fold <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.best.lambda.overall.100fold)
+pred.test.final.lasso.100fold <- predict(lasso.final.100fold,x.test)
+OSR2.lasso.final.100fold <- 1-sum((pred.test.final.lasso.100fold-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.100fold  # 0.651 
+
+lasso.final.1se.100fold <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.lambda.1SErule.overall.100fold)
+pred.test.final.lasso.1se.100fold <- predict(lasso.final.1se.100fold, x.test)
+OSR2.lasso.final.1se.100fold <- 1-sum((pred.test.final.lasso.1se.100fold-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.1se.100fold  # 0.624
+```
+We find almost identical results for OSR2 on the vaulted test data for 10- and 100-fold cv with lasso. Since computation time is lower for 10-fold than 100-fold, we will use that model as our final model.
+
+The results we find with lasso are equivalent or marginally worse to those of the full regression model, or of forward or backward stepwise selection.
+
+```{r}
+coef(lasso.final.10fold)
+coef(lasso.final.1se.10fold)
+```
+The best model with lasso includes all variables except for some of the levels of the `frace` and `mrace` variables, and without the `ppbmi` variable. This is not a well-specified model since the categorical variables are not grouped; to ensure they are grouped while performing lasso regularization we could use the `grplasso` package.
+
+
+## (3) Compare final models
+
+- **(i)** Create a table to compare your final results, summarizing: 
+
+Rows: Full model, Reduced model, Forward stepwise selection, Backward stepwise selection
+Columns: Number of variables in the final model, OSR2 (on the held-out test data)
+
+- **(ii)** Name which variables were most robust (included in all models). Try a model with the most robust variables and compare to the models above.
+
+- **(iii)** Based on the results from (i) and (ii), choose a best prediction model and explain your choice. Remember the objective: create the best prediction model of baby birthweight.
+
+______
+
+
+- **(i) Create a table to compare your final results**:
+
+**Note: In this table we DO count dummy variables as variables.**
+
+```{r}
+results <- matrix(NA, 6, 2) %>% as.data.frame()
+colnames(results) = c("No. var (counting dummy var)", "OSR2")
+rownames(results) = c("Full","Reduced","Forward","Backward","Lasso Best Lambda", "Lasso 1se") 
+
+results$`No. var (counting dummy var)` = c(19, 9, 14, 14, 19, 7)
+results$OSR2 = c(OSR2.full, OSR2.reduced, OSR2.forward.alternative.best, OSR2.backward.alternative.best, OSR2.lasso.final.10fold, OSR2.lasso.final.1se.10fold)
+
+results = round(results, 3)
+
+library(knitr)
+results %>% kable() 
+```
+
+- **(ii) Name which variables were most robust (included in all models). Try a model with the most robust variables and compare to the models above.**
+
+```{r}
+coef(forward.alternative.best) # Included: babysex, bhead, blength, frace, mheight, mrace, ppwt, smoken, wtgain
+coef(lasso.final.10fold) # Included: babysex, bhead, blength, fincome, frace, mrace, malform, menarche, mheight, momage, mrace, ppwt, smoken, wtgain
+coef(lasso.final.1se.10fold) # Included: bhead, blength, mheight, mrace, ppwt, smoken, wtgain
+```
+
+The most robust variables were bhead, blength, mheight, ppwt, mrace, smoken, and wtgain -- which equals 9 variables if we count dummy variables.
+
+We can try a model with these variables:
+```{r}
+mod.robust <- lm(bwt ~ bhead + blength + mheight + mrace + ppwt + smoken + wtgain, data=train)
+summary(mod.robust)
+vif(mod.robust)
+prediction.mod.robust <- predict(mod.robust, newdata=test)
+OSR2.mod.robust <- 1 - sum((prediction.mod.robust - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod.robust # 0.651
+```
+
+This model performs almost equivalently to the best models as summarized in the table above.
+
+- **(iii) Based on the results from the tables above, choose a best prediction model and explain your choice.**
+
+If grouping of variables were not an issue, I would choose the model developed with lasso using the best lambda rule, since we can place confidence in the estimated OSR due to the cross validation approach and the large number of variables included. But because this model does not group the 2 categorical variables, I would not select it as the best model.
+
+Instead, I would choose the model just above -- the reduced linear regression model that includes the intersection of variables included in all the best models. This model performs equivalently to the best models from forward / backward stepwise and lasso, and is more interpretable due to smaller number of variables. Additionally, all of the variables are able to be measured when a mother goes into a clinic, which may be a factor necessary to consider in a clinical application.
+
+
+
+
+## (4) Create a parsimonious model for a clinican
+
+You are now tasked with the objective of creating a prediction model for the clinician (e.g., ob/gyn) for pregnant women. Note that several of the variables included in this data set are either costly or difficult to routinely measure:
+
+- `bhead`, which is very difficult to measure using ultrasound in the womb and requires specially trained technicians
+- `fincome`, which doctors do not commonly know of their patients, and do not have a standard medical reason to request this information
+- `menarche`, age of menstruation, which many women do not remember exactly.
+
+In addition to these variables, keep in mind that it is easier for a clinican to keep in mind the results of models made up of fewer variables than those with many variables.
+
+**(i) Given this information, develop the best model you can for a clinician, keeping in mind the new objective: getting the best prediction of birthweight, which can help triage newborns for support if needed. Justify your choice of best model, and compare to the best overall prediction model from the previous section.**
+
+**(ii) Interpret the signs of each of the coefficients in your chosen model. Based on these interpretations, how would you succintly explain your prediction model to a clinician wanting to identify patients that might give birth to lower birthweight babies?**
+
+```{r}
+mod2 <- lm(bwt ~ . -fincome, data=train)
+summary(mod2)
+vif(mod2)
+prediction.mod2 <- predict(mod2, newdata=test)
+OSR2.mod2 <- 1 - sum((prediction.mod2 - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod2 # 0.652
+
+mod3 <- lm(bwt ~ . -menarche, data=train)
+summary(mod3)
+vif(mod3)
+prediction.mod3 <- predict(mod3, newdata=test)
+OSR2.mod3 <- 1 - sum((prediction.mod3 - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod3 # 0.652
+
+mod4 <- lm(bwt ~ . -bhead, data=train)
+summary(mod4)
+vif(mod4)
+prediction.mod4 <- predict(mod4, newdata=test)
+OSR2.mod4 <- 1 - sum((prediction.mod4 - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod4 # 0.539
+
+mod5 <- lm(bwt ~ . -bhead -fincome -menarche, data=train)
+summary(mod5)
+vif(mod5)
+prediction.mod5 <- predict(mod5, newdata=test)
+OSR2.mod5 <- 1 - sum((prediction.mod5 - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod5 # 0.538
+
+mod6 <- lm(bwt ~ blength + mrace + smoken + wtgain, data=train)
+summary(mod6)
+vif(mod6)
+prediction.mod6 <- predict(mod6, newdata=test)
+OSR2.mod6 <- 1 - sum((prediction.mod6 - test$bwt)^2) / sum((mean(train$bwt) - test$bwt)^2)
+OSR2.mod6 # 0.528
+```
+
+We find that `fincome` and `menarche` were contributing almost nothing to out of sample prediction. `bhead` on the other hand was helping to increase the accuracy of prediction. Without including this variable, our OSR2 with linear regression drops from .65 to .53. 
+
+Let's see if we can do any better by fitting a lasso model that doesn't include these three variables, using 10 fold cv and 50 iterations:
+
+```{r}
+
+x.train = model.matrix(bwt ~ . -bhead -fincome -menarche, data=train)
+y.train = train$bwt
+x.test = model.matrix(bwt ~ . -bhead -fincome -menarche, data=test)
+y.test = test$bwt
+
+set.seed(101)
+
+n.iterations <- 50
+n.folds <- 10
+res = lapply(1:n.iterations, function(i){
+  fit = cv.glmnet(x=x.train,y=y.train,nfolds=n.folds,lambda=lambdas.lasso,alpha=1)
+  data.frame(iter=i, lambda=fit$lambda, MSE_mean=fit$cvm, se=fit$cvsd)
+})
+res = do.call(rbind,res)
+
+# To find the best lambda overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then choose the lambda that minimizes that mean MSE:
+summarized_lambda = res %>% 
+  group_by(lambda) %>% 
+  summarise(MSE=mean(MSE_mean),
+            se=mean(se)) %>%
+  arrange(desc(lambda))
+
+idx = which.min(summarized_lambda$MSE)
+cv.lasso.best.lambda.overall.10fold.mod2 = summarized_lambda$lambda[idx]
+cv.lasso.best.lambda.overall.10fold.mod2
+
+# To find the best lambda+1se overall, we calculate mean results over iterations: We first find the mean MSE at each value of lambda over all iterations, then find the lambda that minimizes that mean MSE (above). Then we find the closest lambda value giving the MSE equal to min(MSE)+1se:
+index_1se = with(summarized_lambda,which(MSE < MSE[idx]+se[idx])[1])
+cv.lasso.lambda.1SErule.overall.10fold.mod2 = summarized_lambda$lambda[index_1se]
+cv.lasso.lambda.1SErule.overall.10fold.mod2
+
+
+lasso.final.10fold.mod2 <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.best.lambda.overall.10fold.mod2)
+coef(lasso.final.10fold.mod2)
+pred.test.final.lasso.10fold.mod2 <- predict(lasso.final.10fold.mod2,x.test)
+OSR2.lasso.final.10fold.mod2 <- 1-sum((pred.test.final.lasso.10fold.mod2-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.10fold.mod2  # 0.538 
+
+
+lasso.final.1se.10fold.mod2 <- glmnet(x.train,
+                      y.train,
+                      alpha=1,
+                      lambda=cv.lasso.lambda.1SErule.overall.10fold.mod2)
+coef(lasso.final.1se.10fold.mod2) # blength, mheight, mrace (1 dummy variable), ppwt, smoken, wtgain
+pred.test.final.lasso.1se.10fold.mod2 <- predict(lasso.final.1se.10fold.mod2, x.test)
+OSR2.lasso.final.1se.10fold.mod2 <- 1-sum((pred.test.final.lasso.1se.10fold.mod2-test$bwt)^2)/sum((mean(train$bwt)-test$bwt)^2)
+OSR2.lasso.final.1se.10fold.mod2  # 0.500
+```
+
+**(i) Given this information, develop the best model you can for a clinician, keeping in mind the objective: getting the best prediction of birthweight, which can help triage newborns for support if needed. Justify your choice of best model, and compare to the best overall prediction model from the previous section.**
+
+- We obtain an almost identical OSR2 with lasso as a full linear regression subtracting out the 3 'difficult to measure' variables (OSR2 = 0.538). 
+- We obtain an OSR2 using a manually-curated reduced linear regression model (mod6) of 0.528 when using only the 4 variables: blength, mrace (all levels), smoken, wtgain
+- We obtain an OSR2 of 0.500 for the lasso model using the 1se rule. 
+
+In this situation, we obtain superior models using linear regression without regularization, which have the advantages of preserving grouped variables, having more interpretable coefficients, p-values associated with each variable, all while achieving a similar OSR2. Performance in OSR2 is almost as high for the manually-curated model using only 4 variables (6 if dummy variables are included) (blength, mrace, smoken, wtgain), 0.528 vs. 0.538, a less than 2% difference in OSR2. This loss in accuracy is compensated for by the gain in interpretability and the ease of communication and retention. We therefore choose this model as our best model to present to the clinican.
+
+**(ii) Interpret the signs of each of the coefficients in your chosen model. Based on these interpretations, how would you succintly explain your prediction model to a clinician wanting to identify patients that might have low birthweight babies?**
+
+```{r}
+summary(mod6)
+```
+
+- Larger baby length leads to larger baby weight (statistically significant)
+- Mothers that are black, Asian, and Puerto Rican have babies that are smaller birthweight than white mothers (statistically significant)
+- Baby weight decreases with the number of cigarettes smoked per day (statistically significant)
+- Larger weight gain leads to larger baby size (statistically significant)
+
+Overall, babies that measure smaller at 37 weeks in gestation (in the womb), and that come from mothers that smoke, gain less weight, and are not white, are more likely to give birth to babies of smaller birthweight. The prediction model can identify particular combinations of these variables that are more likely to lead to lower birthweight babies.
+
+Next week we will introduce methods for logistic regression, which will allow us to directly predict binary cases, such as whether a baby will be low birthweight or not; this may be more useful for clinicans than predicting the baby's actual birthweight.
