@@ -1038,5 +1038,3 @@ summary(mod6)
 - Larger weight gain leads to larger baby size (statistically significant)
 
 Overall, babies that measure smaller at 37 weeks in gestation (in the womb), and that come from mothers that smoke, gain less weight, and are not white, are more likely to give birth to babies of smaller birthweight. The prediction model can identify particular combinations of these variables that are more likely to lead to lower birthweight babies.
-
-Next week we will introduce methods for logistic regression, which will allow us to directly predict binary cases, such as whether a baby will be low birthweight or not; this may be more useful for clinicans than predicting the baby's actual birthweight.
